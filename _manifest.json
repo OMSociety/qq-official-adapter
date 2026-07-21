@@ -1,0 +1,52 @@
+{
+  "manifest_version": 2,
+  "id": "qq-official-adapter",
+  "version": "1.1.1",
+  "name": "QQ 官方机器人适配器",
+  "description": "通过 QQ 官方 WebSocket 与 OpenAPI 接入群聊、单聊和频道消息的 MaiBot 适配器。",
+  "author": {
+    "name": "清蒸云鸭",
+    "url": "https://github.com/WhiteCloudOL"
+  },
+  "license": "AGPL-3.0",
+  "plugin_type": "adapter",
+  "urls": {
+    "repository": "https://github.com/WhiteCloudOL/qq-official-adapter",
+    "homepage": "https://github.com/WhiteCloudOL/qq-official-adapter",
+    "documentation": "https://github.com/WhiteCloudOL/qq-official-adapter#readme",
+    "issues": "https://github.com/WhiteCloudOL/qq-official-adapter/issues"
+  },
+  "host_application": {
+    "min_version": "1.0.6",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.7.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "aiohttp",
+      "version_spec": ">=3.8.0"
+    }
+  ],
+  "capabilities": [
+    "chat.open_session",
+    "gateway.route_message",
+    "gateway.update_state",
+    "message.get_by_id"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": ["zh-CN"]
+  },
+  "display": {
+    "icon": {
+      "type": "local",
+      "value": "assets/icon.png",
+      "fallback": "database",
+      "background": "#f4e8da"
+    }
+  }
+}
