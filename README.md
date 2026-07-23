@@ -7,8 +7,8 @@
 <p align="center"><strong>让 MaiBot 通过 QQ 官方能力接入单聊、群聊与频道</strong></p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.1.1-e96f51">
-  <img alt="MaiBot SDK" src="https://img.shields.io/badge/MaiBot_SDK-2.7%2B-2f8f9d">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.1.2-e96f51">
+  <img alt="MaiBot SDK" src="https://img.shields.io/badge/MaiBot_SDK-2.4%2B-2f8f9d">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-3776ab">
   <img alt="License" src="https://img.shields.io/badge/license-AGPL--3.0-59636e">
 </p>
@@ -21,8 +21,7 @@
 
 - 在 QQ 单聊、群聊、文字子频道和频道私信中使用 MaiBot。
 - 接收文字、图片、表情、语音、视频和文件，并保留可供 MaiBot 使用的媒体内容。
-- 发送文字、图片和表情；表情会按图片消息发送，不会显示为无效的 `[表情]` 文本。
-- 自动判断群聊消息是否真正艾特当前机器人，无需在插件配置里重复填写机器人 ID。
+- 发送文字、图片和表情；表情会按图片消息发送。
 - 自动处理重复事件、短时断线和被动回复时效，减少重复回复与串群回复。
 
 > 实际可用场景取决于机器人在 QQ 开放平台获得的权限。快速创建的私人机器人通常只供创建者使用，是否支持群聊、频道和全量消息以开放平台页面显示为准。
@@ -33,11 +32,11 @@
 
 打开 [QQ 机器人开放平台](https://q.qq.com/qqbot/openclaw/)，创建机器人并妥善保存 `AppID` 与 `AppSecret`。
 
-> **安全提醒：** AppSecret 等同于机器人密码，不要提交到 Git、README、日志或截图中。若 AppSecret 已经出现在截图或公开位置，请立即到开放平台重置。
+> **安全提醒：** AppSecret 等同于机器人密码，请注意安全保存。
 
 ### 2. 安装插件
 
-将本仓库放入 MaiBot 的 `plugins/qq-official-adapter` 目录。MaiBot 会根据清单安装依赖。
+将本仓库放入 MaiBot 的 `MaiBot/plugins/` 目录，MaiBot 会根据清单安装依赖。
 
 ### 3. 填写插件配置
 
@@ -49,7 +48,7 @@
 | AppID | QQ 开放平台显示的 AppID |
 | AppSecret | 与 AppID 对应的 AppSecret |
 
-聊天名单过滤默认关闭，不配置即可正常使用。需要限制允许接入的群或用户时，再启用“聊天过滤”并填写 QQ 官方 OpenID。
+聊天名单过滤默认关闭，不配置即可正常使用。需要限制允许接入的群或用户时，再启用“聊天过滤”并填写 QQ 官方 OpenID（注意这里不是单纯的群号和QQ号，请根据实际日志显示的OpenID填写）。
 
 ### 4. 设置 MaiBot 主账号
 
@@ -124,10 +123,6 @@ QQ群与单聊中的表情使用图片富媒体发送。纯图片或纯表情回
 先确认日志收到的是 `GROUP_AT_MESSAGE_CREATE` 或 `GROUP_MESSAGE_CREATE`。插件会根据事件类型、WebSocket 自身 ID、mentions 与消息元素共同判断，并把结果直接交给 MaiBot，不依赖插件内的手工机器人 ID 配置。
 
 若日志显示插件已识别，但 MaiBot 仍无法发送回复，检查 `bot_config.toml` 的 `qq_account` 是否等于就绪日志里的 `self_id`。
-
-### 图片回复前出现 `[图片]`
-
-这不是 QQ 官方 API 的强制要求。插件只会发送真实文字段，媒体摘要不会作为独立文本下发。若升级后仍出现，请保留出站消息结构和对应日志以便排查。
 
 ### 收不到群聊或频道消息
 
