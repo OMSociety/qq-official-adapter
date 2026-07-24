@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from hashlib import sha256
 from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
-import asyncio
 import base64
 import binascii
-import ipaddress
+import math
 import re
-import socket
 import time
+
+from aiohttp import ClientError
 
 from .constants import (
     EVENT_AT_MESSAGE_CREATE,
@@ -23,9 +23,14 @@ from .constants import (
     EVENT_MESSAGE_CREATE,
     GROUP_PASSIVE_REPLY_TTL_SEC,
     INBOUND_MESSAGE_DEDUP_TTL_SEC,
+    MAX_INBOUND_ATTACHMENTS,
     MAX_INBOUND_MEDIA_BYTES,
+    MAX_MESSAGE_SEGMENTS,
+    MAX_OUTBOUND_MEDIA_BYTES,
+    MAX_RUNTIME_STATE_ENTRIES,
     PRIVATE_PASSIVE_REPLY_TTL_SEC,
     TRUSTED_QQ_MEDIA_HOSTS,
+    TRUSTED_QQ_MEDIA_HOST_SUFFIXES,
 )
 from .models import OutboundMedia, PassiveReplyContext, QQMessageTarget
 
@@ -48,8 +53,12 @@ class QQMessageMixin:
         ttl = PRIVATE_PASSIVE_REPLY_TTL_SEC if target.kind == "user" else GROUP_PASSIVE_REPLY_TTL_SEC
         self._passive_replies[target.route_key] = PassiveReplyContext(
             message_id=msg_id,
-            expire_at=time.time() + ttl,
+            expire_at=time.monotonic() + ttl,
         )
+        while len(self._passive_replies) > MAX_RUNTIME_STATE_ENTRIES:
+            oldest_route = next(iter(self._passive_replies))
+            oldest_context = self._passive_replies.pop(oldest_route)
+            self._reply_sequences.pop(oldest_context.message_id, None)
 
     def _is_duplicate_inbound_message(self, message_id: str) -> bool:
         """记录消息 ID，并判断它是否属于官方重复推送。"""
@@ -57,13 +66,16 @@ class QQMessageMixin:
         self._purge_expired_runtime_state()
         if message_id in self._seen_inbound_message_ids:
             return True
-        self._seen_inbound_message_ids[message_id] = time.time() + INBOUND_MESSAGE_DEDUP_TTL_SEC
+        self._seen_inbound_message_ids[message_id] = time.monotonic() + INBOUND_MESSAGE_DEDUP_TTL_SEC
+        while len(self._seen_inbound_message_ids) > MAX_RUNTIME_STATE_ENTRIES:
+            oldest_message_id = next(iter(self._seen_inbound_message_ids))
+            self._seen_inbound_message_ids.pop(oldest_message_id, None)
         return False
 
     def _purge_expired_runtime_state(self) -> None:
         """清理过期的被动回复、序号和去重状态。"""
 
-        now = time.time()
+        now = time.monotonic()
         expired_routes = [route_key for route_key, context in self._passive_replies.items() if context.expire_at <= now]
         for route_key in expired_routes:
             context = self._passive_replies.pop(route_key)
@@ -82,7 +94,7 @@ class QQMessageMixin:
     ) -> Dict[str, Any]:
         """将 QQ 官方事件数据转换为 MaiBot 标准消息字典。"""
 
-        msg_id = str(data.get("id") or "").strip()
+        msg_id = self._normalize_qq_identifier(data.get("id"), "消息 ID")
         if not msg_id:
             raise ValueError(f"{event_type} 事件缺少消息 ID")
         raw_content = self._extract_event_content(data)
@@ -108,25 +120,23 @@ class QQMessageMixin:
 
         if is_qq_group or is_guild:
             if is_guild:
-                group_id = str(data.get("channel_id") or "").strip()
+                group_id = self._normalize_qq_identifier(data.get("channel_id"), "频道 ID")
                 if not group_id:
                     raise ValueError("频道事件缺少 channel_id")
                 target_kind = "channel"
             else:
-                group_id = str(data.get("group_openid") or data.get("group_id") or "").strip()
+                group_id = self._first_qq_identifier(data, ("group_openid", "group_id"), "群聊 ID")
                 if not group_id:
                     raise ValueError("群聊事件缺少 group_openid")
                 target_kind = "group"
-            user_id = str(
-                author.get("member_openid")
-                or author.get("openid")
-                or author.get("id")
-                or author.get("user_openid")
-                or ""
-            ).strip()
+            user_id = self._first_qq_identifier(
+                author,
+                ("member_openid", "openid", "id", "user_openid"),
+                "发送者 ID",
+            )
             if not user_id:
                 raise ValueError("群聊/频道事件缺少发送者 ID")
-            user_nickname = str(author.get("username") or author.get("nickname") or user_id).strip() or user_id
+            user_nickname = self._first_display_text(author, ("username", "nickname")) or user_id
             additional_config: Dict[str, Any] = {
                 "self_id": self._connected_account_id,
                 "platform_io_account_id": self._connected_account_id,
@@ -138,7 +148,10 @@ class QQMessageMixin:
             }
             if is_guild:
                 additional_config["qq_official_channel_id"] = group_id
-                additional_config["qq_official_guild_id"] = str(data.get("guild_id") or "").strip()
+                guild_id = self._normalize_qq_identifier(data.get("guild_id"), "频道服务器 ID")
+                if not guild_id:
+                    raise ValueError("频道事件缺少 guild_id")
+                additional_config["qq_official_guild_id"] = guild_id
             additional_config["qq_official_passive_reply_msg_id"] = msg_id
             message_info: Dict[str, Any] = {
                 "user_info": {
@@ -150,10 +163,14 @@ class QQMessageMixin:
                 "group_info": {"group_id": group_id, "group_name": group_id},
             }
         else:
-            user_id = str(author.get("user_openid") or author.get("openid") or author.get("id") or "").strip()
+            user_id = self._first_qq_identifier(
+                author,
+                ("user_openid", "openid", "id"),
+                "发送者 ID",
+            )
             if not user_id:
                 raise ValueError("私聊事件缺少发送者 user_openid")
-            user_nickname = str(author.get("username") or author.get("nickname") or user_id).strip() or user_id
+            user_nickname = self._first_display_text(author, ("username", "nickname")) or user_id
             target_kind = "direct" if is_guild_direct else "user"
             additional_config = {
                 "self_id": self._connected_account_id,
@@ -166,7 +183,7 @@ class QQMessageMixin:
                 "is_mentioned": is_at,
             }
             if is_guild_direct:
-                guild_id = str(data.get("guild_id") or "").strip()
+                guild_id = self._normalize_qq_identifier(data.get("guild_id"), "频道服务器 ID")
                 if not guild_id:
                     raise ValueError("频道私信事件缺少 guild_id")
                 additional_config["qq_official_guild_id"] = guild_id
@@ -213,7 +230,7 @@ class QQMessageMixin:
         message_reference = data.get("message_reference")
         reply_to = ""
         if isinstance(message_reference, Mapping):
-            reply_to = str(message_reference.get("message_id") or "").strip()
+            reply_to = self._optional_qq_identifier(message_reference.get("message_id"), "引用消息 ID")
 
         message_dict: Dict[str, Any] = {
             "message_id": msg_id,
@@ -238,7 +255,8 @@ class QQMessageMixin:
     def _extract_event_content(data: Mapping[str, Any]) -> str:
         """提取标准 content，兼容全量群消息的 msg_elements 文本结构。"""
 
-        content = str(data.get("content") or "").strip()
+        raw_content = data.get("content")
+        content = raw_content.strip() if isinstance(raw_content, str) else ""
         if content:
             return content
 
@@ -263,6 +281,60 @@ class QQMessageMixin:
                 if isinstance(nested_content, str) and nested_content.strip():
                     element_texts.append(nested_content.strip())
         return "".join(element_texts).strip()
+
+    @staticmethod
+    def _normalize_qq_identifier(value: Any, field_name: str) -> str:
+        """校验来自 QQ 事件的 OpenID、消息 ID 等不透明标识。"""
+
+        if value is None or value == "":
+            return ""
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} 必须是字符串")
+        normalized_value = value.strip()
+        if len(normalized_value) > 256:
+            raise ValueError(f"{field_name} 长度不能超过 256")
+        if any(ord(character) < 32 or ord(character) == 127 for character in normalized_value):
+            raise ValueError(f"{field_name} 不能包含控制字符")
+        return normalized_value
+
+    @classmethod
+    def _optional_qq_identifier(cls, value: Any, field_name: str) -> str:
+        """返回有效的可选 QQ 标识符；无效候选不参与身份匹配。"""
+
+        try:
+            return cls._normalize_qq_identifier(value, field_name)
+        except ValueError:
+            return ""
+
+    @classmethod
+    def _first_qq_identifier(
+        cls,
+        mapping: Mapping[str, Any],
+        keys: Tuple[str, ...],
+        field_name: str,
+    ) -> str:
+        """按优先级返回第一个有效 QQ 标识符。"""
+
+        for key in keys:
+            value = mapping.get(key)
+            if value is None or value == "":
+                continue
+            return cls._normalize_qq_identifier(value, field_name)
+        return ""
+
+    @staticmethod
+    def _first_display_text(mapping: Mapping[str, Any], keys: Tuple[str, ...]) -> str:
+        """提取有限长、无控制字符的展示名称。"""
+
+        for key in keys:
+            value = mapping.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            normalized_value = "".join(
+                character if character.isprintable() else " " for character in value.strip()
+            )
+            return normalized_value[:128]
+        return ""
 
     @staticmethod
     def _strip_protocol_tags(content: str) -> str:
@@ -295,7 +367,9 @@ class QQMessageMixin:
                 if not isinstance(mention, Mapping):
                     continue
                 mention_ids = {
-                    str(mention.get(key) or "").strip() for key in ("id", "openid", "user_openid", "member_openid")
+                    mention_id
+                    for key in ("id", "openid", "user_openid", "member_openid")
+                    if (mention_id := self._optional_qq_identifier(mention.get(key), "机器人 mention ID"))
                 }
                 if bot_ids.intersection(mention_ids):
                     return True
@@ -331,28 +405,34 @@ class QQMessageMixin:
     def _is_current_bot_name(self, names: set[str]) -> bool:
         """判断 mention 展示名是否属于当前机器人。"""
 
-        names.discard("")
-        if self._connected_account_name and self._connected_account_name in names:
+        normalized_names = {name for name in names if name}
+        if self._connected_account_name and self._connected_account_name in normalized_names:
             return True
         appid = self._load_settings().credentials.appid
-        return bool(appid and any(appid in name for name in names))
+        return bool(appid and f"机器人{appid}" in normalized_names)
 
     def _is_current_bot_identity(self, identity: Mapping[str, Any]) -> bool:
         """判断事件中的机器人身份是否属于当前连接。"""
 
         identity_ids = {
-            str(identity.get(key) or "").strip() for key in ("id", "openid", "user_openid", "member_openid")
+            identity_id
+            for key in ("id", "openid", "user_openid", "member_openid")
+            if (identity_id := self._optional_qq_identifier(identity.get(key), "机器人身份 ID"))
         }
         if self._known_bot_ids().intersection(identity_ids):
             return True
-        identity_names = {str(identity.get(key) or "").strip() for key in ("username", "nickname", "name")}
+        identity_names = {
+            value.strip()
+            for key in ("username", "nickname", "name")
+            if isinstance((value := identity.get(key)), str) and value.strip()
+        }
         return self._is_current_bot_name(identity_names)
 
     def _remember_bot_identity(self, identity: Mapping[str, Any]) -> None:
         """记录事件中已确认属于当前机器人的场景 OpenID。"""
 
         for key in ("id", "openid", "user_openid", "member_openid"):
-            identity_value = str(identity.get(key) or "").strip()
+            identity_value = self._optional_qq_identifier(identity.get(key), "机器人身份 ID")
             if identity_value:
                 self._bot_mention_ids.add(identity_value)
 
@@ -367,7 +447,7 @@ class QQMessageMixin:
                     continue
                 self._remember_bot_identity(mention)
                 for key in ("id", "openid", "user_openid", "member_openid"):
-                    mention_id = str(mention.get(key) or "").strip()
+                    mention_id = self._optional_qq_identifier(mention.get(key), "机器人 mention ID")
                     if mention_id:
                         return mention_id
 
@@ -427,13 +507,7 @@ class QQMessageMixin:
             if ("at" in normalized_key or "mention" in normalized_key) and isinstance(raw_value, Mapping):
                 target_ids = {
                     str(raw_value.get(target_key) or "").strip()
-                    for target_key in (
-                        "id",
-                        "openid",
-                        "user_id",
-                        "target_id",
-                        "member_openid",
-                    )
+                    for target_key in ("id", "openid", "user_id", "target_id", "member_openid")
                 }
                 if bot_ids.intersection(target_ids):
                     return True
@@ -441,14 +515,7 @@ class QQMessageMixin:
                 return True
             if (
                 looks_like_mention
-                and normalized_key
-                in {
-                    "id",
-                    "openid",
-                    "user_id",
-                    "target_id",
-                    "member_openid",
-                }
+                and normalized_key in {"id", "openid", "user_id", "target_id", "member_openid"}
                 and str(raw_value) in bot_ids
             ):
                 return True
@@ -481,6 +548,11 @@ class QQMessageMixin:
         attachments = data.get("attachments")
         if not isinstance(attachments, list):
             return [], [], False, False
+        if len(attachments) > MAX_INBOUND_ATTACHMENTS:
+            self.ctx.logger.warning(
+                f"QQ 入站附件数量超过 {MAX_INBOUND_ATTACHMENTS} 个限制，仅处理前 {MAX_INBOUND_ATTACHMENTS} 个"
+            )
+            attachments = attachments[:MAX_INBOUND_ATTACHMENTS]
 
         segments: List[Dict[str, Any]] = []
         labels: List[str] = []
@@ -495,6 +567,14 @@ class QQMessageMixin:
             content_type = str(attachment.get("content_type") or attachment.get("type") or "").strip().lower()
             filename = str(attachment.get("filename") or "").strip()
             url = str(attachment.get("voice_wav_url") or attachment.get("url") or "").strip()
+            if url:
+                try:
+                    self._validate_qq_media_url(url)
+                except RuntimeError as exc:
+                    self.ctx.logger.warning(
+                        f"QQ 入站附件地址不可信，已拒绝: host={self._safe_url_host(url)} error={exc}"
+                    )
+                    url = ""
             attachment_type = str(attachment.get("type") or "").strip().lower()
             is_emoji_attachment = (
                 attachment_type in {"emoji", "face", "sticker"}
@@ -594,15 +674,15 @@ class QQMessageMixin:
         """安全下载 QQ 入站附件，返回原始二进制。"""
 
         try:
-            await self._validate_public_media_url(url)
+            self._validate_qq_media_url(url)
             await self._ensure_media_session()
-            assert self._media_session is not None
+            if self._media_session is None:
+                raise RuntimeError("QQ 附件下载客户端尚未就绪")
             async with self._media_session.get(url, allow_redirects=False) as response:
                 if 300 <= response.status < 400:
                     raise RuntimeError(f"附件地址返回重定向: HTTP {response.status}")
                 if response.status >= 400:
                     raise RuntimeError(f"HTTP {response.status}")
-                await self._validate_public_media_url(str(response.url))
                 if response.content_length and response.content_length > MAX_INBOUND_MEDIA_BYTES:
                     raise RuntimeError(f"附件超过 {MAX_INBOUND_MEDIA_BYTES // 1024 // 1024} MiB 限制")
                 chunks: List[bytes] = []
@@ -613,61 +693,63 @@ class QQMessageMixin:
                         raise RuntimeError(f"附件超过 {MAX_INBOUND_MEDIA_BYTES // 1024 // 1024} MiB 限制")
                     chunks.append(chunk)
                 return b"".join(chunks)
-        except Exception as exc:
-            self.ctx.logger.warning(f"QQ 入站附件下载失败: host={urlsplit(url).netloc} error={exc}")
+        except (ClientError, RuntimeError, TimeoutError, ValueError) as exc:
+            self.ctx.logger.warning(f"QQ 入站附件下载失败: host={self._safe_url_host(url)} error={exc}")
             return b""
 
     @staticmethod
-    async def _validate_public_media_url(url: str) -> None:
-        """拒绝非 HTTP(S) 和解析到本机/内网的附件 URL。"""
+    def _validate_qq_media_url(url: str) -> None:
+        """只允许少数 QQ 官方 HTTPS 媒体域名。"""
 
-        parsed_url = urlsplit(url)
-        if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
-            raise RuntimeError("QQ 附件 URL 不是有效的 HTTP(S) 地址")
-        normalized_hostname = parsed_url.hostname.lower()
-        if parsed_url.scheme == "https" and normalized_hostname in TRUSTED_QQ_MEDIA_HOSTS:
-            # TUN 代理的 Fake-IP 模式会把 QQ 官方媒体域名映射到保留地址。
-            return
+        if len(url) > 4096 or any(ord(character) < 32 or ord(character) == 127 for character in url):
+            raise RuntimeError("QQ 附件 URL 过长或包含控制字符")
         try:
-            addresses = [ipaddress.ip_address(normalized_hostname)]
-        except ValueError:
-            loop = asyncio.get_running_loop()
-            try:
-                address_info = await loop.getaddrinfo(
-                    normalized_hostname,
-                    parsed_url.port or (443 if parsed_url.scheme == "https" else 80),
-                    type=socket.SOCK_STREAM,
-                )
-            except socket.gaierror as exc:
-                raise RuntimeError(f"无法解析 QQ 附件域名: {normalized_hostname}") from exc
-            addresses = [ipaddress.ip_address(item[4][0]) for item in address_info]
+            parsed_url = urlsplit(url)
+            parsed_port = parsed_url.port
+        except ValueError as exc:
+            raise RuntimeError("QQ 附件 URL 格式无效") from exc
+        if parsed_url.scheme != "https" or not parsed_url.hostname:
+            raise RuntimeError("QQ 附件 URL 必须是有效的 HTTPS 地址")
+        if parsed_url.username is not None or parsed_url.password is not None:
+            raise RuntimeError("QQ 附件 URL 不能包含用户凭据")
+        if parsed_port not in {None, 443}:
+            raise RuntimeError("QQ 附件 URL 端口无效")
+        normalized_hostname = parsed_url.hostname.lower().rstrip(".")
+        is_trusted_suffix = any(
+            normalized_hostname == suffix or normalized_hostname.endswith(f".{suffix}")
+            for suffix in TRUSTED_QQ_MEDIA_HOST_SUFFIXES
+        )
+        if normalized_hostname not in TRUSTED_QQ_MEDIA_HOSTS and not is_trusted_suffix:
+            raise RuntimeError("QQ 附件 URL 不属于受信任的 QQ 媒体域名")
 
-        if not addresses or any(
-            address.is_private
-            or address.is_loopback
-            or address.is_link_local
-            or address.is_multicast
-            or address.is_reserved
-            or address.is_unspecified
-            for address in addresses
-        ):
-            raise RuntimeError("QQ 附件 URL 指向非公网地址，已拒绝下载")
+    @staticmethod
+    def _safe_url_host(url: str) -> str:
+        """安全提取用于日志的主机名，不回显查询参数。"""
+
+        try:
+            return urlsplit(url).hostname or "<无效>"
+        except ValueError:
+            return "<无效>"
 
     @staticmethod
     def _parse_event_timestamp(raw_timestamp: Any) -> float:
         """解析 QQ 官方事件时间戳为 unix 秒。"""
 
-        if isinstance(raw_timestamp, (int, float)) and raw_timestamp > 0:
-            return float(raw_timestamp)
-        if isinstance(raw_timestamp, str) and raw_timestamp:
+        if isinstance(raw_timestamp, (int, float)) and not isinstance(raw_timestamp, bool):
+            timestamp = float(raw_timestamp)
+            if math.isfinite(timestamp) and timestamp > 0:
+                return timestamp
+            raise ValueError("QQ 事件时间戳必须是正的有限数值")
+        if isinstance(raw_timestamp, str) and raw_timestamp.strip():
             try:
-                dt = datetime.fromisoformat(raw_timestamp)
+                normalized_timestamp = raw_timestamp.strip().replace("Z", "+00:00")
+                dt = datetime.fromisoformat(normalized_timestamp)
                 if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
+                    raise ValueError("QQ 事件时间戳缺少时区")
                 return dt.timestamp()
-            except ValueError:
-                pass
-        return time.time()
+            except ValueError as exc:
+                raise ValueError(f"QQ 事件时间戳格式无效: {raw_timestamp!r}") from exc
+        raise ValueError("QQ 事件缺少有效时间戳")
 
     def _is_inbound_message_allowed(self, message_dict: Mapping[str, Any]) -> bool:
         """检查入站消息是否通过聊天黑白名单过滤。"""
@@ -698,8 +780,10 @@ class QQMessageMixin:
         if message_type == "group":
             group_info = message_info.get("group_info", {})
             if not isinstance(group_info, Mapping):
-                return True
+                return False
             group_openid = str(group_info.get("group_id") or "").strip()
+            if not group_openid:
+                return False
             allowed = self._is_id_allowed_by_list_policy(
                 group_openid, settings.chat.group_list_type, settings.chat.group_list
             )
@@ -707,6 +791,8 @@ class QQMessageMixin:
                 self.ctx.logger.info(f"QQ 官方群聊 {group_openid} 未通过聊天名单过滤，消息已丢弃")
             return allowed
 
+        if message_type != "private":
+            return False
         allowed = self._is_id_allowed_by_list_policy(
             user_id, settings.chat.private_list_type, settings.chat.private_list
         )
@@ -731,8 +817,16 @@ class QQMessageMixin:
 
         target = self._target_from_message_dict(message)
         if target is None:
-            target_group_id = str(route.get("group_id") or route.get("platform_io_target_group_id") or "").strip()
-            target_user_id = str(route.get("user_id") or route.get("platform_io_target_user_id") or "").strip()
+            target_group_id = self._first_qq_identifier(
+                route,
+                ("group_id", "platform_io_target_group_id"),
+                "出站群聊目标 ID",
+            )
+            target_user_id = self._first_qq_identifier(
+                route,
+                ("user_id", "platform_io_target_user_id"),
+                "出站用户目标 ID",
+            )
             if target_group_id:
                 target = QQMessageTarget(kind="group", target_id=target_group_id)
             elif target_user_id:
@@ -758,8 +852,8 @@ class QQMessageMixin:
 
         return target, reply_msg_id
 
-    @staticmethod
-    def _target_from_message_dict(message: Mapping[str, Any]) -> Optional[QQMessageTarget]:
+    @classmethod
+    def _target_from_message_dict(cls, message: Mapping[str, Any]) -> Optional[QQMessageTarget]:
         """从入站或出站标准消息中恢复 QQ API 目标类型。"""
 
         message_info = message.get("message_info", {})
@@ -769,11 +863,24 @@ class QQMessageMixin:
         if not isinstance(additional_config, Mapping):
             additional_config = {}
 
-        target_kind = str(additional_config.get("qq_official_target_type") or "").strip().lower()
-        group_id = str(additional_config.get("platform_io_target_group_id") or "").strip()
-        user_id = str(additional_config.get("platform_io_target_user_id") or "").strip()
-        channel_id = str(additional_config.get("qq_official_channel_id") or group_id).strip()
-        guild_id = str(additional_config.get("qq_official_guild_id") or "").strip()
+        raw_target_kind = additional_config.get("qq_official_target_type")
+        target_kind = raw_target_kind.strip().lower() if isinstance(raw_target_kind, str) else ""
+        group_id = cls._normalize_qq_identifier(
+            additional_config.get("platform_io_target_group_id"),
+            "群聊目标 ID",
+        )
+        user_id = cls._normalize_qq_identifier(
+            additional_config.get("platform_io_target_user_id"),
+            "用户目标 ID",
+        )
+        channel_id = cls._normalize_qq_identifier(
+            additional_config.get("qq_official_channel_id") or group_id,
+            "频道目标 ID",
+        )
+        guild_id = cls._normalize_qq_identifier(
+            additional_config.get("qq_official_guild_id"),
+            "频道服务器 ID",
+        )
 
         if target_kind == "channel" and channel_id:
             return QQMessageTarget(kind="channel", target_id=channel_id, guild_id=guild_id)
@@ -796,6 +903,8 @@ class QQMessageMixin:
         raw_message = message.get("raw_message") or message.get("message_segments")
         if not isinstance(raw_message, list):
             return []
+        if len(raw_message) > MAX_MESSAGE_SEGMENTS:
+            raise ValueError(f"出站消息段超过 {MAX_MESSAGE_SEGMENTS} 个限制")
         return [segment for segment in raw_message if isinstance(segment, Mapping)]
 
     @staticmethod
@@ -847,7 +956,7 @@ class QQMessageMixin:
                 binary_data = binary_data or cls._normalize_base64_data(
                     data.get("base64") or data.get("file_data") or data.get("binary_data_base64")
                 )
-                url = str(data.get("url") or "").strip()
+                url = cls._normalize_outbound_media_url(data.get("url"))
                 name = str(data.get("name") or "").strip()
                 mime_type = str(data.get("mime_type") or "").strip().lower()
                 if seg_type == "file":
@@ -860,7 +969,7 @@ class QQMessageMixin:
             elif isinstance(data, str):
                 raw_data = data.strip()
                 if raw_data.startswith(("http://", "https://")):
-                    url = raw_data
+                    url = cls._normalize_outbound_media_url(raw_data)
                 elif not binary_data:
                     binary_data = cls._normalize_base64_data(raw_data)
 
@@ -876,6 +985,30 @@ class QQMessageMixin:
         return media_items
 
     @staticmethod
+    def _normalize_outbound_media_url(value: Any) -> str:
+        """规范化交给 QQ 平台拉取的 HTTP(S) 媒体 URL。"""
+
+        if not isinstance(value, str):
+            return ""
+        url = value.strip()
+        if not url or len(url) > 4096:
+            return ""
+        try:
+            parsed_url = urlsplit(url)
+            parsed_port = parsed_url.port
+        except ValueError:
+            return ""
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
+            return ""
+        if parsed_url.username is not None or parsed_url.password is not None:
+            return ""
+        if parsed_port is not None and not 1 <= parsed_port <= 65535:
+            return ""
+        if any(ord(character) < 32 or ord(character) == 127 for character in url):
+            return ""
+        return url
+
+    @staticmethod
     def _normalize_base64_data(value: Any) -> str:
         """验证并规范化 Base64，防止把 hash 或 ``[图片]`` 当作文件上传。"""
 
@@ -888,11 +1021,14 @@ class QQMessageMixin:
             _, separator, encoded_data = encoded_data.partition(",")
             if not separator:
                 return ""
+        max_encoded_length = ((MAX_OUTBOUND_MEDIA_BYTES + 2) // 3) * 4
+        if len(encoded_data) > max_encoded_length:
+            return ""
         try:
             decoded_data = base64.b64decode(encoded_data, validate=True)
         except (binascii.Error, ValueError):
             return ""
-        if not decoded_data:
+        if not decoded_data or len(decoded_data) > MAX_OUTBOUND_MEDIA_BYTES:
             return ""
         return base64.b64encode(decoded_data).decode("ascii")
 
@@ -942,5 +1078,20 @@ class QQMessageMixin:
             ):
                 if key in payload_source:
                     payload[key] = payload_source[key]
+            if not cls._is_valid_rich_payload(payload):
+                continue
             rich_payloads.append(payload)
         return rich_payloads
+
+    @staticmethod
+    def _is_valid_rich_payload(payload: Mapping[str, Any]) -> bool:
+        """校验 QQ 结构化消息的必需字段与基本类型。"""
+
+        msg_type = payload.get("msg_type")
+        if msg_type == 0:
+            content = payload.get("content")
+            return isinstance(content, str) and bool(content.strip())
+        required_field = {2: "markdown", 3: "ark", 4: "embed"}.get(msg_type)
+        if required_field is None:
+            return False
+        return isinstance(payload.get(required_field), Mapping)

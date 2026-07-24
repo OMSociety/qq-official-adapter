@@ -10,6 +10,10 @@ from pydantic import field_validator
 from .constants import SUPPORTED_CONFIG_VERSION
 
 
+_MAX_CONFIGURED_IDS = 1000
+_MAX_QQ_IDENTIFIER_LENGTH = 256
+
+
 def _schema_i18n(
     *,
     label_en: str,
@@ -78,6 +82,7 @@ class QQOfficialCredentialsSection(PluginConfigBase):
 
     appid: str = Field(
         default="",
+        max_length=128,
         description="QQ 开放平台机器人 AppID。",
         json_schema_extra={
             "label": "AppID",
@@ -93,6 +98,7 @@ class QQOfficialCredentialsSection(PluginConfigBase):
     )
     app_secret: str = Field(
         default="",
+        max_length=512,
         description="QQ 开放平台机器人 AppSecret。",
         json_schema_extra={
             "label": "AppSecret",
@@ -123,6 +129,18 @@ class QQOfficialCredentialsSection(PluginConfigBase):
             "order": 2,
         },
     )
+
+    @field_validator("appid", "app_secret", mode="before")
+    @classmethod
+    def _normalize_credentials(cls, value: Any) -> str:
+        """规范化凭据文本，并拒绝非字符串及控制字符。"""
+
+        if not isinstance(value, str):
+            raise ValueError("QQ 机器人凭据必须是字符串")
+        normalized_value = value.strip()
+        if any(ord(character) < 32 or ord(character) == 127 for character in normalized_value):
+            raise ValueError("QQ 机器人凭据不能包含控制字符")
+        return normalized_value
 
 
 class QQOfficialChatSection(PluginConfigBase):
@@ -179,6 +197,7 @@ class QQOfficialChatSection(PluginConfigBase):
     )
     group_list: List[str] = Field(
         default_factory=list,
+        max_length=_MAX_CONFIGURED_IDS,
         description="群聊名单中的 group_openid 列表。",
         json_schema_extra={
             "hint": "QQ 官方机器人使用 group_openid，不是群号；列表会自动去重。",
@@ -213,6 +232,7 @@ class QQOfficialChatSection(PluginConfigBase):
     )
     private_list: List[str] = Field(
         default_factory=list,
+        max_length=_MAX_CONFIGURED_IDS,
         description="私聊名单中的 user_openid 列表。",
         json_schema_extra={
             "hint": "QQ 官方机器人使用 user_openid；列表会自动去重。",
@@ -231,6 +251,7 @@ class QQOfficialChatSection(PluginConfigBase):
     )
     ban_user_id: List[str] = Field(
         default_factory=list,
+        max_length=_MAX_CONFIGURED_IDS,
         description="全局屏蔽的用户 openid 列表。",
         json_schema_extra={
             "hint": "这些用户的消息会在进入 Host 之前被直接丢弃。",
@@ -253,25 +274,37 @@ class QQOfficialChatSection(PluginConfigBase):
     def _normalize_list_types(cls, value: Any) -> Literal["whitelist", "blacklist"]:
         """规范化名单模式字段。"""
 
-        normalized_value = str(value or "whitelist").strip().lower()
+        if not isinstance(value, str):
+            raise ValueError("名单模式必须是字符串")
+        normalized_value = value.strip().lower()
         if normalized_value not in {"whitelist", "blacklist"}:
+            raise ValueError("名单模式只能是 whitelist 或 blacklist")
+        if normalized_value == "whitelist":
             return "whitelist"
-        return normalized_value  # type: ignore[return-value]
+        return "blacklist"
 
     @field_validator("group_list", "private_list", "ban_user_id", mode="before")
     @classmethod
     def _normalize_id_lists(cls, value: Any) -> List[str]:
         """规范化 ID 列表字段。"""
 
-        if value is None:
-            return []
-        raw_values = value if isinstance(value, list) else [value]
+        if not isinstance(value, list):
+            raise ValueError("QQ OpenID 名单必须是字符串列表")
+        if len(value) > _MAX_CONFIGURED_IDS:
+            raise ValueError(f"QQ OpenID 名单最多包含 {_MAX_CONFIGURED_IDS} 项")
+
         normalized_values: List[str] = []
         seen_values: set[str] = set()
-        for raw_value in raw_values:
-            normalized_value = str(raw_value or "").strip()
+        for raw_value in value:
+            if not isinstance(raw_value, str):
+                raise ValueError("QQ OpenID 名单只能包含字符串")
+            normalized_value = raw_value.strip()
             if not normalized_value or normalized_value in seen_values:
                 continue
+            if len(normalized_value) > _MAX_QQ_IDENTIFIER_LENGTH:
+                raise ValueError(f"QQ OpenID 长度不能超过 {_MAX_QQ_IDENTIFIER_LENGTH}")
+            if any(ord(character) < 32 or ord(character) == 127 for character in normalized_value):
+                raise ValueError("QQ OpenID 不能包含控制字符")
             normalized_values.append(normalized_value)
             seen_values.add(normalized_value)
         return normalized_values

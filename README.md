@@ -7,7 +7,7 @@
 <p align="center"><strong>基于 QQ 官方能力，为 MaiBot 提供单聊、群聊与频道消息接入</strong></p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.1.3-2388ff">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.1.4-2388ff">
   <img alt="MaiBot SDK" src="https://img.shields.io/badge/MaiBot_SDK-2.7%2B-2f8f9d">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-3776ab">
   <img alt="License" src="https://img.shields.io/badge/license-AGPL--3.0-59636e">
@@ -25,6 +25,7 @@
 - 自动判断群聊消息是否真正艾特当前机器人，无需在插件配置里重复填写机器人 ID。
 - 自动读取 MaiBot 的机器人昵称，并在聊天上下文中保留 `@机器人昵称`，避免艾特信息丢失。
 - 自动处理重复事件、短时断线和被动回复时效，减少重复回复与串群回复。
+- 对网关地址、附件来源、响应体积、媒体体积和运行时缓存设置安全边界。
 
 > 实际可用场景取决于机器人在 QQ 开放平台获得的权限。快速创建的私人机器人通常只供创建者使用，是否支持群聊、频道和全量消息以开放平台页面显示为准。
 
@@ -112,6 +113,18 @@ qq_account = "日志中的 self_id"
 | 频道私信 | 文字及附件 | 文字、图片、Markdown、Ark、Embed |
 
 QQ群与单聊中的表情使用图片富媒体发送。纯图片或纯表情回复不会再额外发送 `[图片]`、`[表情]` 占位文字。入站图片和表情会保留原始二进制供 MaiBot 识别；下载失败时降级为对应的媒体摘要，普通文件仍保留文件信息。
+
+## 安全边界
+
+- AccessToken 只随 QQ OpenAPI 请求发送，不作为 HTTP 会话的默认请求头；WebSocket 最终连接地址必须是当前 QQ OpenAPI 主机的 `wss` 地址。
+- 入站附件只接受少数 QQ 官方 HTTPS 媒体域名，拒绝重定向、异常端口、内嵌用户凭据和非 QQ 来源，避免附件事件成为 SSRF 入口。
+- 单个入站或出站媒体限制为 20 MiB，单条事件最多处理 10 个附件；HTTP 响应、WebSocket 消息和运行时去重缓存也设有上限。
+- 插件关闭或凭据不完整时，出站网关同样拒绝发送，不会隐式获取 AccessToken。
+- 清单仅申请配置读取、消息路由和网关状态上报三项实际使用的 Host 能力。
+
+当前附件白名单包括 `nt.qq.com.cn`、`nt.qq.com` 本身及其任意层级子域名（`*.nt.qq.com.cn`、`*.nt.qq.com`），以及 `grouppro.grouppro.qq.com`。
+
+插件不会主动记录 `AppSecret` 或 AccessToken，但两者仍应视为机器人密码。请勿提交本地 `config.toml` 或其备份；一旦怀疑泄露，应立即在 QQ 开放平台轮换。
 
 ## 日志与排错
 
