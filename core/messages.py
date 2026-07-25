@@ -98,8 +98,6 @@ class QQMessageMixin:
         if not msg_id:
             raise ValueError(f"{event_type} 事件缺少消息 ID")
         raw_content = self._extract_event_content(data)
-        has_inline_emoji = bool(_QQ_FACE_TAG_PATTERN.search(raw_content))
-        inline_emoji_only = has_inline_emoji and not self._strip_protocol_tags(raw_content).strip()
         content = self._normalize_event_content(raw_content)
 
         author = data.get("author") or {}
@@ -202,7 +200,6 @@ class QQMessageMixin:
             is_picture,
             attachment_contains_emoji,
         ) = await self._build_attachment_segments(data)
-        contains_emoji = attachment_contains_emoji or has_inline_emoji
         if attachment_contains_emoji and content in {"[表情]", "[动画表情]"}:
             content = ""
 
@@ -240,7 +237,7 @@ class QQMessageMixin:
             "raw_message": raw_message,
             "is_mentioned": is_at,
             "is_at": is_at,
-            "is_emoji": inline_emoji_only or (contains_emoji and not content and len(attachment_segments) == 1),
+            "is_emoji": False,
             "is_picture": is_picture,
             "is_command": content.startswith("/"),
             "is_notify": False,
@@ -373,7 +370,7 @@ class QQMessageMixin:
                 }
                 if bot_ids.intersection(mention_ids):
                     return True
-                if mention.get("bot") is True and self._is_current_bot_identity(mention):
+                if self._is_current_bot_identity(mention):
                     self._remember_bot_identity(mention)
                     return True
 
@@ -585,6 +582,7 @@ class QQMessageMixin:
             )
 
             if content_type.startswith("image/") or attachment_type in {"image", "emoji", "face", "sticker"}:
+                is_picture = True
                 binary_data = await self._download_attachment(url) if url else b""
                 segment_type = "emoji" if is_emoji_attachment else "image"
                 if binary_data:
@@ -596,12 +594,11 @@ class QQMessageMixin:
                             "hash": sha256(binary_data).hexdigest(),
                         }
                     )
-                    is_picture = is_picture or not is_emoji_attachment
                 elif url or filename:
                     self.ctx.logger.debug(f"QQ 入站图片已降级为媒体摘要: {urlsplit(url).netloc}")
                     segments.append(
                         {
-                            "type": segment_type,
+                            "type": "text",
                             "data": "[表情]" if is_emoji_attachment else "[图片]",
                         }
                     )

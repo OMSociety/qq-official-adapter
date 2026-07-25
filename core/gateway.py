@@ -614,9 +614,12 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
             if additional_config.get("qq_official_message_type") == "group":
                 scope_label = f" 群={group_info.get('group_id') or '?'}"
             plain_text = str(message_dict.get("processed_plain_text") or "")
+            plain_text_preview = plain_text[:200]
+            if len(plain_text) > 200:
+                plain_text_preview += "…"
             self.ctx.logger.debug(
                 f"收到 QQ 官方入站消息: event={event_type} id={external_message_id or '?'} "
-                f"from={sender_label}{scope_label} text_length={len(plain_text)}"
+                f"from={sender_label}{scope_label} text={plain_text_preview!r}"
             )
 
         route_metadata: Dict[str, Any] = {"self_id": self._connected_account_id}

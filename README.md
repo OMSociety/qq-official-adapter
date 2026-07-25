@@ -7,7 +7,7 @@
 <p align="center"><strong>基于 QQ 官方能力，为 MaiBot 提供单聊、群聊与频道消息接入</strong></p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.1.4-2388ff">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.1.5-2388ff">
   <img alt="MaiBot SDK" src="https://img.shields.io/badge/MaiBot_SDK-2.7%2B-2f8f9d">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-3776ab">
   <img alt="License" src="https://img.shields.io/badge/license-AGPL--3.0-59636e">
@@ -69,7 +69,7 @@ platform = "qq"
 qq_account = "日志中的 self_id"
 ```
 
-插件会直接使用 `READY.user.id` 判断入站消息是否艾特自己；`qq_account` 仍需填写，是因为 MaiBot 主程序还会用它标记机器人自己发送的消息。不要把 AppID、QQ 号或 OneBot v11 的机器人 QQ 号填到这里。
+插件会结合 `READY.user.id` 与 QQ 官方事件中的机器人身份判断入站消息是否艾特自己；群聊使用独立机器人 OpenID 时也会自动识别，无需在插件配置中重复填写。`qq_account` 仍需填写，是因为 MaiBot 主程序还会用它标记机器人自己发送的消息。不要把 AppID、QQ 号或 OneBot v11 的机器人 QQ 号填到这里。
 
 机器人显示名称会从 MaiBot 的 `bot.nickname` 自动读取。例如昵称为 `みう` 时，群聊中的机器人艾特会以 `@みう 消息内容` 进入聊天上下文，无需在插件配置中再次填写名称或机器人 ID。
 
@@ -114,6 +114,8 @@ qq_account = "日志中的 self_id"
 
 QQ群与单聊中的表情使用图片富媒体发送。纯图片或纯表情回复不会再额外发送 `[图片]`、`[表情]` 占位文字。入站图片和表情会保留原始二进制供 MaiBot 识别；下载失败时降级为对应的媒体摘要，普通文件仍保留文件信息。
 
+MaiBot 对首次出现的图片采用后台识别：适配器收到图片后会先上报媒体组件，图片描述生成完成后再补入聊天上下文；已经识别过的相同图片会直接使用缓存描述。
+
 ## 安全边界
 
 - AccessToken 只随 QQ OpenAPI 请求发送，不作为 HTTP 会话的默认请求头；WebSocket 最终连接地址必须是当前 QQ OpenAPI 主机的 `wss` 地址。
@@ -150,7 +152,7 @@ QQ群与单聊中的表情使用图片富媒体发送。纯图片或纯表情回
 
 ### 群里艾特机器人，但 MaiBot 没有识别
 
-先确认调试日志收到的是 `GROUP_AT_MESSAGE_CREATE` 或 `GROUP_MESSAGE_CREATE`。插件会根据事件类型、WebSocket 自身 ID、mentions 与消息元素共同判断，不依赖插件内的手工机器人 ID 配置。识别成功后，聊天上下文中会保留 `@机器人昵称`；昵称来自 MaiBot 的 `bot.nickname`。
+先确认调试日志收到的是 `GROUP_AT_MESSAGE_CREATE` 或 `GROUP_MESSAGE_CREATE`。插件会根据事件类型、WebSocket 自身 ID、结构化 mentions 与消息元素共同判断，并自动学习 QQ 群聊范围内的机器人 OpenID，不依赖插件内的手工机器人 ID 配置。识别成功后，聊天上下文中会保留 `@机器人昵称`；昵称来自 MaiBot 的 `bot.nickname`。
 
 若日志显示插件已识别，但 MaiBot 仍无法发送回复，检查 `bot_config.toml` 的 `qq_account` 是否等于就绪日志里的 `self_id`。
 
