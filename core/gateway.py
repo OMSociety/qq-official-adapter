@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Dict, List, Mapping, Optional
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple, cast
+from urllib.parse import urlsplit
 
 import asyncio
 import json
@@ -27,7 +28,10 @@ from .constants import (
     EVENT_READY,
     EVENT_RESUMED,
     HEARTBEAT_FAIL_LIMIT,
+    MAX_HEARTBEAT_INTERVAL_MS,
+    MAX_WEBSOCKET_MESSAGE_BYTES,
     MESSAGE_CREATE_EVENTS,
+    MIN_HEARTBEAT_INTERVAL_MS,
     OP_DISPATCH,
     OP_HEARTBEAT,
     OP_HEARTBEAT_ACK,
@@ -54,7 +58,7 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
         """初始化适配器插件状态。"""
 
         super().__init__()
-        self._access_token: str = ""
+        self._access_token: Optional[str] = None
         self._access_token_expire_at: float = 0.0
         self._token_lock: asyncio.Lock = asyncio.Lock()
         self._token_session: Optional[ClientSession] = None
@@ -68,11 +72,12 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
         self._heartbeat_interval_ms: int = 0
         self._heartbeat_task: Optional[asyncio.Task[None]] = None
         self._heartbeat_fail_count: int = 0
+        self._heartbeat_ack_pending: bool = False
         self._connected_account_id: str = ""
         self._connected_account_name: str = ""
         self._bot_display_name: str = ""
         self._bot_mention_ids: set[str] = set()
-        self._passive_replies: Dict[str, PassiveReplyContext] = {}
+        self._passive_replies: Dict[Tuple[str, str, str], PassiveReplyContext] = {}
         self._reply_sequences: Dict[str, int] = {}
         self._seen_inbound_message_ids: Dict[str, float] = {}
         self._seq_lock: asyncio.Lock = asyncio.Lock()
@@ -137,6 +142,10 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
         del kwargs
 
         settings = self._load_settings()
+        if not settings.should_connect():
+            return {"success": False, "error": "QQ 官方适配器未启用"}
+        if not settings.credentials.appid or not settings.credentials.app_secret:
+            return {"success": False, "error": "QQ 官方适配器缺少 AppID 或 AppSecret"}
 
         try:
             target, reply_msg_id = self._build_outbound_target(message, route or {})
@@ -211,7 +220,7 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
     def _load_settings(self) -> QQOfficialAdapterSettings:
         """返回当前强类型配置。"""
 
-        return self.config  # type: ignore[return-value]
+        return cast(QQOfficialAdapterSettings, self.config)
 
     async def _restart_connection_if_needed(self) -> None:
         """根据当前配置重启 WebSocket 连接循环。"""
@@ -245,7 +254,7 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
             self._connection_task = None
 
         await self._disconnect()
-        await self._report_gateway_ready(False)
+        await self._report_gateway_ready(False, settings=self._load_settings())
         self._connected_account_id = ""
 
     async def _run_connection_loop(self) -> None:
@@ -256,7 +265,7 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
             try:
                 await self._get_access_token()
                 await self._connect(settings)
-                await self._identify_or_resume(settings)
+                await self._identify_or_resume()
                 await self._listen()
             except asyncio.CancelledError:
                 raise
@@ -273,7 +282,7 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
                         f"QQ 官方 WebSocket 断开清理异常: {cleanup_exc!r}",
                         exc_info=True,
                     )
-                await self._report_gateway_ready(False)
+                await self._report_gateway_ready(False, settings=settings)
 
             if self._stop_event is None or self._stop_event.is_set():
                 break
@@ -284,43 +293,67 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
 
         base_url = API_BASE_SANDBOX if settings.credentials.sandbox else API_BASE_PRODUCTION
         gateway_url = await self._fetch_gateway_url(base_url)
-        self.ctx.logger.info(f"QQ 官方 WebSocket 正在连接: {gateway_url}")
-        assert self._api_session is not None
-        self._ws = await self._api_session.ws_connect(gateway_url)
+        self.ctx.logger.info(f"QQ 官方 WebSocket 正在连接: host={urlsplit(gateway_url).hostname}")
+        if self._api_session is None:
+            raise RuntimeError("QQ 官方 HTTP 客户端尚未就绪")
+        self._ws = await self._api_session.ws_connect(
+            gateway_url,
+            max_msg_size=MAX_WEBSOCKET_MESSAGE_BYTES,
+        )
 
     async def _fetch_gateway_url(self, base_url: str) -> str:
         """调用 /gateway/bot 获取 WebSocket URL（同时返回分片建议，这里只用 url）。"""
 
         await self._get_access_token()
-        assert self._api_session is not None
+        request_access_token = self._access_token
+        if self._api_session is None:
+            raise RuntimeError("QQ 官方 HTTP 客户端尚未就绪")
         request_url = f"{base_url}/gateway/bot"
-        async with self._api_session.get(request_url) as response:
+        async with self._api_session.get(
+            request_url,
+            headers=self._authorization_headers(),
+            allow_redirects=False,
+        ) as response:
             status = response.status
-            response_text = await response.text()
+            response_text = await self._read_response_text(response)
 
         if status == 401:
             self.ctx.logger.debug("QQ 网关地址请求 401，刷新 access_token 后重试")
-            self._access_token = ""
+            if self._access_token == request_access_token:
+                self._access_token = None
             await self._get_access_token()
-            assert self._api_session is not None
-            async with self._api_session.get(request_url) as response:
+            if self._api_session is None:
+                raise RuntimeError("QQ 官方 HTTP 客户端尚未就绪")
+            async with self._api_session.get(
+                request_url,
+                headers=self._authorization_headers(),
+                allow_redirects=False,
+            ) as response:
                 status = response.status
-                response_text = await response.text()
+                response_text = await self._read_response_text(response)
 
-        if status >= 400:
-            raise RuntimeError(f"获取 QQ WebSocket 网关地址失败: HTTP {status} {response_text}")
+        if not 200 <= status < 300:
+            try:
+                error_data = json.loads(response_text)
+            except json.JSONDecodeError:
+                error_data = {}
+            error_message = self._response_error_message(error_data)
+            raise RuntimeError(f"获取 QQ WebSocket 网关地址失败: HTTP {status} {error_message}")
         try:
             data = json.loads(response_text)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"QQ 网关响应不是有效 JSON: HTTP {status}") from exc
         if not isinstance(data, Mapping):
             raise RuntimeError(f"QQ 网关响应结构无效: {data!r}")
-        url = str(data.get("url") or "").strip()
+        raw_url = data.get("url")
+        if not isinstance(raw_url, str):
+            raise RuntimeError("QQ 网关响应缺少有效的 url 字段")
+        url = raw_url.strip()
         if not url:
-            raise RuntimeError(f"QQ 网关响应缺少 url 字段: {data}")
-        return url
+            raise RuntimeError("QQ 网关响应缺少 url 字段")
+        return self._validate_gateway_url(url, base_url)
 
-    async def _identify_or_resume(self, settings: QQOfficialAdapterSettings) -> None:
+    async def _identify_or_resume(self) -> None:
         """等待 Hello 后发送 Identify 或 Resume。"""
 
         if self._ws is None:
@@ -328,18 +361,32 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
 
         hello_payload = await self._receive_payload(expect_op=OP_HELLO, timeout=10)
         hello_data = hello_payload.get("d") or {}
-        self._heartbeat_interval_ms = int(hello_data.get("heartbeat_interval") or 30000)
+        if not isinstance(hello_data, Mapping):
+            raise RuntimeError("QQ WebSocket Hello 数据结构无效")
+        raw_heartbeat_interval = hello_data.get("heartbeat_interval")
+        if isinstance(raw_heartbeat_interval, bool):
+            raise RuntimeError("QQ WebSocket 心跳间隔无效")
+        try:
+            heartbeat_interval_ms = int(raw_heartbeat_interval)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("QQ WebSocket 心跳间隔无效") from exc
+        if not MIN_HEARTBEAT_INTERVAL_MS <= heartbeat_interval_ms <= MAX_HEARTBEAT_INTERVAL_MS:
+            raise RuntimeError(
+                f"QQ WebSocket 心跳间隔超出允许范围: {heartbeat_interval_ms}ms"
+            )
+        self._heartbeat_interval_ms = heartbeat_interval_ms
         self.ctx.logger.debug(f"QQ 官方 WebSocket Hello: heartbeat_interval={self._heartbeat_interval_ms}ms")
 
         self._heartbeat_fail_count = 0
+        self._heartbeat_ack_pending = False
         self._heartbeat_task = asyncio.create_task(self._run_heartbeat(), name="qq-official-heartbeat")
 
         if self._resumable and self._session_id:
-            await self._send_resume(settings)
+            await self._send_resume()
         else:
-            await self._send_identify(settings)
+            await self._send_identify()
 
-    async def _send_identify(self, settings: QQOfficialAdapterSettings) -> None:
+    async def _send_identify(self) -> None:
         """发送 Identify 鉴权包。"""
 
         access_token = await self._get_access_token()
@@ -359,12 +406,12 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
         await self._send_payload(payload)
         self.ctx.logger.debug("QQ 官方 WebSocket 已发送 Identify")
 
-    async def _send_resume(self, settings: QQOfficialAdapterSettings) -> None:
+    async def _send_resume(self) -> None:
         """发送 Resume 断线续传包。"""
 
         if self._last_seq is None:
             self._resumable = False
-            await self._send_identify(settings)
+            await self._send_identify()
             return
 
         access_token = await self._get_access_token()
@@ -377,7 +424,7 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
             },
         }
         await self._send_payload(payload)
-        self.ctx.logger.debug(f"QQ 官方 WebSocket 已发送 Resume: session_id={self._session_id} seq={self._last_seq}")
+        self.ctx.logger.debug(f"QQ 官方 WebSocket 已发送 Resume: seq={self._last_seq}")
 
     async def _run_heartbeat(self) -> None:
         """按固定间隔发送心跳。"""
@@ -390,8 +437,20 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
                 await asyncio.sleep(interval_sec)
             except asyncio.CancelledError:
                 raise
+            if self._heartbeat_ack_pending:
+                self._heartbeat_fail_count += 1
+                self.ctx.logger.warning(
+                    f"QQ 官方 WebSocket 心跳未收到 ACK "
+                    f"({self._heartbeat_fail_count}/{HEARTBEAT_FAIL_LIMIT})"
+                )
+                if self._heartbeat_fail_count >= HEARTBEAT_FAIL_LIMIT:
+                    self.ctx.logger.error(f"QQ 官方 WebSocket 连续 {HEARTBEAT_FAIL_LIMIT} 次未收到心跳 ACK")
+                    if self._ws is not None and not self._ws.closed:
+                        await self._ws.close()
+                    return
             try:
                 await self._send_payload({"op": OP_HEARTBEAT, "d": self._last_seq})
+                self._heartbeat_ack_pending = True
             except Exception as exc:
                 self._heartbeat_fail_count += 1
                 self.ctx.logger.warning(
@@ -429,7 +488,7 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
         try:
             payload = json.loads(raw_payload)
         except json.JSONDecodeError:
-            self.ctx.logger.warning(f"QQ 官方 WebSocket 收到非 JSON 文本: {raw_payload[:120]}")
+            self.ctx.logger.warning(f"QQ 官方 WebSocket 收到非 JSON 文本: length={len(raw_payload)}")
             return
         if not isinstance(payload, dict):
             self.ctx.logger.warning(f"QQ 官方 WebSocket 收到非对象 JSON: type={type(payload).__name__}")
@@ -437,11 +496,12 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
 
         op = payload.get("op")
         seq = payload.get("s")
-        if isinstance(seq, int):
+        if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0:
             self._last_seq = seq
 
         if op == OP_HEARTBEAT_ACK:
             self._heartbeat_fail_count = 0
+            self._heartbeat_ack_pending = False
             return
 
         if op == OP_RECONNECT:
@@ -477,18 +537,22 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
             return
 
         if event_type == EVENT_READY:
-            self._session_id = str(data.get("session_id") or "").strip()
+            self._session_id = self._normalize_qq_identifier(data.get("session_id"), "WebSocket session_id")
+            if not self._session_id:
+                raise RuntimeError("QQ READY 事件缺少 session_id")
             user = data.get("user") or {}
             if isinstance(user, Mapping):
-                self._connected_account_id = str(user.get("id") or self._load_settings().credentials.appid).strip()
-                self._connected_account_name = str(user.get("username") or user.get("name") or "").strip()
+                self._connected_account_id = self._normalize_qq_identifier(user.get("id"), "机器人自身 ID")
+                if not self._connected_account_id:
+                    raise RuntimeError("QQ READY 事件缺少机器人自身 ID")
+                self._connected_account_name = self._first_display_text(user, ("username", "name"))
                 self._remember_bot_identity(user)
             else:
-                self._connected_account_id = self._load_settings().credentials.appid
+                raise RuntimeError("QQ READY 事件的 user 字段结构无效")
             self._resumable = True
             await self._report_gateway_ready(True, settings=self._load_settings())
             self.ctx.logger.info(
-                f"QQ 官方 WebSocket 已就绪: session_id={self._session_id} self_id={self._connected_account_id}"
+                f"QQ 官方 WebSocket 已就绪: self_id={self._connected_account_id}"
             )
             return
 
@@ -507,7 +571,11 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
             self.ctx.logger.debug(f"QQ 官方自身消息已忽略: event={event_type}")
             return
 
-        external_message_id = str(data.get("id") or "").strip()
+        try:
+            external_message_id = self._normalize_qq_identifier(data.get("id"), "消息 ID")
+        except ValueError as exc:
+            self.ctx.logger.warning(f"QQ 官方 {event_type} 事件消息 ID 无效，已丢弃: {exc}")
+            return
         if not external_message_id:
             self.ctx.logger.warning(f"QQ 官方 {event_type} 事件缺少消息 ID，已丢弃")
             return
@@ -545,10 +613,10 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
             scope_label = ""
             if additional_config.get("qq_official_message_type") == "group":
                 scope_label = f" 群={group_info.get('group_id') or '?'}"
-            plain_text = str(message_dict.get("processed_plain_text") or "")[:60]
+            plain_text = str(message_dict.get("processed_plain_text") or "")
             self.ctx.logger.debug(
                 f"收到 QQ 官方入站消息: event={event_type} id={external_message_id or '?'} "
-                f"from={sender_label}{scope_label} text={plain_text!r}"
+                f"from={sender_label}{scope_label} text_length={len(plain_text)}"
             )
 
         route_metadata: Dict[str, Any] = {"self_id": self._connected_account_id}
@@ -598,7 +666,7 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
                 if isinstance(payload, dict) and payload.get("op") == expect_op:
                     return payload
                 continue
-            if ws_message.type in {WSMsgType.CLOSED, WSMsgType.ERROR}:
+            if ws_message.type in {WSMsgType.CLOSED, WSMsgType.CLOSING, WSMsgType.ERROR}:
                 raise RuntimeError("QQ 官方 WebSocket 在等待 Hello 时已关闭")
 
     async def _disconnect(self) -> None:
@@ -629,6 +697,31 @@ class QQOfficialAdapterPlugin(QQAPIClientMixin, QQMessageMixin, MaiBotPlugin):
         self._media_session = None
 
         self._heartbeat_fail_count = 0
+        self._heartbeat_ack_pending = False
+
+    @staticmethod
+    def _validate_gateway_url(gateway_url: str, base_url: str) -> str:
+        """确保远端返回的 WebSocket 地址仍属于当前 QQ API 主机。"""
+
+        try:
+            parsed_gateway_url = urlsplit(gateway_url)
+            parsed_base_url = urlsplit(base_url)
+            gateway_port = parsed_gateway_url.port
+        except ValueError as exc:
+            raise RuntimeError("QQ WebSocket 网关地址格式无效") from exc
+        if parsed_gateway_url.scheme != "wss":
+            raise RuntimeError("QQ WebSocket 网关地址必须使用 wss")
+        gateway_hostname = (parsed_gateway_url.hostname or "").rstrip(".")
+        base_hostname = (parsed_base_url.hostname or "").rstrip(".")
+        if not gateway_hostname or gateway_hostname != base_hostname:
+            raise RuntimeError("QQ WebSocket 网关地址主机与 OpenAPI 主机不一致")
+        if parsed_gateway_url.username is not None or parsed_gateway_url.password is not None:
+            raise RuntimeError("QQ WebSocket 网关地址不能包含用户凭据")
+        if gateway_port not in {None, 443}:
+            raise RuntimeError("QQ WebSocket 网关地址端口无效")
+        if parsed_gateway_url.fragment:
+            raise RuntimeError("QQ WebSocket 网关地址不能包含片段")
+        return gateway_url
 
     async def _report_gateway_ready(
         self,
