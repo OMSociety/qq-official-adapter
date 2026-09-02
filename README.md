@@ -50,6 +50,7 @@
 | 启用适配器 | 开启 |
 | AppID | QQ 开放平台显示的 AppID |
 | AppSecret | 与 AppID 对应的 AppSecret |
+| 启用 markdown 输出 | 开启 |
 
 聊天名单过滤默认关闭，不配置即可正常使用。需要限制允许接入的群或用户时，再启用“聊天过滤”并填写 QQ 官方 OpenID（注意这里不是单纯的群号和QQ号，请根据实际日志显示的OpenID填写）。
 

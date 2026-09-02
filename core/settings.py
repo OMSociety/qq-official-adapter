@@ -310,11 +310,35 @@ class QQOfficialChatSection(PluginConfigBase):
         return normalized_values
 
 
+class QQOfficialMessageSection(PluginConfigBase):
+    """消息发送行为配置。"""
+
+    __ui_label__: ClassVar[str] = "消息发送"
+    __ui_order__: ClassVar[int] = 2
+
+    enable_markdown_output: bool = Field(
+        default=True,
+        description="出站消息使用 markdown 格式输出。",
+        json_schema_extra={
+            "hint": "开启后端到 QQ 的消息统一走 markdown(msg_type=2) 通道，使所有 markdown 内容（含「@ 用户」内嵌标签、加粗、列表等）都能被客户端正确解析；关闭后走纯文本(msg_type=0)。",
+            "i18n": _schema_i18n(
+                label_en="Enable markdown output",
+                label_ja="マークダウン出力を有効化",
+                hint_en="When on, outbound messages go through the markdown (msg_type=2) channel and all markdown content (including '@ user' inline tags) is parsed; when off, they go as plain text (msg_type=0).",
+                hint_ja="オンの場合、送信メッセージはマークダウン (msg_type=2) チャネル経由で送信され、すべてのマークダウン（@ユーザーのインラインタグを含む）が解析されます。オフの場合はプレーンテキスト (msg_type=0) で送信されます。",
+            ),
+            "label": "启用 markdown 输出",
+            "order": 0,
+        },
+    )
+
+
 class QQOfficialAdapterSettings(PluginConfigBase):
     """QQ 官方机器人适配器完整配置。"""
 
     plugin: QQOfficialPluginSection = Field(default_factory=QQOfficialPluginSection)
     credentials: QQOfficialCredentialsSection = Field(default_factory=QQOfficialCredentialsSection)
+    message: QQOfficialMessageSection = Field(default_factory=QQOfficialMessageSection)
     chat: QQOfficialChatSection = Field(default_factory=QQOfficialChatSection)
 
     def should_connect(self) -> bool:

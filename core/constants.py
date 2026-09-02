@@ -1,7 +1,7 @@
 """定义 QQ 协议常量。"""
 
 QQ_OFFICIAL_GATEWAY_NAME = "qq_official_gateway"
-SUPPORTED_CONFIG_VERSION = "1.1.0"
+SUPPORTED_CONFIG_VERSION = "1.2.0"
 
 # 这是 QQ 官方公开鉴权端点，不是硬编码凭据。
 APP_ACCESS_TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"  # nosec B105
